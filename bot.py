@@ -139,9 +139,9 @@ def fetch_forex_gold(ticker: str) -> pd.DataFrame:
 
 
 def fetch_crypto(symbol: str) -> pd.DataFrame:
-    """Fetch the last 300 hourly candles for a crypto pair from Binance."""
+    """Fetch the last 300 hourly candles for a crypto pair from KuCoin."""
     try:
-        exchange = ccxt.binance({"enableRateLimit": True})
+        exchange = ccxt.kucoin({"enableRateLimit": True})
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=300)
         df = pd.DataFrame(
             ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]
