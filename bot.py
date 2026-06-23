@@ -261,6 +261,55 @@ def get_sr_levels(df: pd.DataFrame) -> dict:
     }
 
 # ══════════════════════════════════════════════════════════
+#  ⭐  SIGNAL GRADING
+# ══════════════════════════════════════════════════════════
+
+def grade_signal(touches: int) -> str:
+    """Rate signal quality based on how many times price touched the level."""
+    if touches >= 4:
+        return "⭐⭐⭐ A+"   # very strong level — high priority
+    elif touches == 3:
+        return "⭐⭐ B"      # decent level — worth watching
+    else:
+        return "⭐ C"        # weak level — be cautious
+
+
+# ══════════════════════════════════════════════════════════
+#  📊  VOLUME CONFIRMATION
+# ══════════════════════════════════════════════════════════
+
+def volume_confirmed(df: pd.DataFrame) -> bool:
+    """
+    Returns True if the breakout candle's volume is
+    at least 1.5x the 20-bar average — confirms real momentum.
+    """
+    if "volume" not in df.columns or df["volume"].iloc[-20:].sum() == 0:
+        return False   # no volume data (some forex feeds don't have it)
+    avg_vol     = df["volume"].iloc[-20:].mean()
+    current_vol = df["volume"].iloc[-1]
+    return current_vol >= avg_vol * 1.5
+
+
+# ══════════════════════════════════════════════════════════
+#  🕐  MARKET SESSION FILTER
+# ══════════════════════════════════════════════════════════
+
+def is_active_session(asset_type: str) -> bool:
+    """
+    Crypto trades 24/7 — always active.
+    Forex and Gold — only fire signals during London or New York session.
+    London  : 08:00 – 17:00 UTC
+    New York: 13:00 – 22:00 UTC
+    """
+    if asset_type == "Crypto":
+        return True
+    hour    = datetime.utcnow().hour
+    london  = 8  <= hour < 17
+    new_york= 13 <= hour < 22
+    return london or new_york
+
+
+# ══════════════════════════════════════════════════════════
 #  💥  BREAKOUT DETECTION
 # ══════════════════════════════════════════════════════════
 
@@ -293,14 +342,16 @@ def detect_breakout(df: pd.DataFrame, sr: dict) -> dict | None:
                 sl = lvl - _atr                     # SL just below broken level
                 tp = c0 + (c0 - sl) * RISK_REWARD
                 return {
-                    "side":    "LONG 📈",
-                    "entry":   c0,
-                    "sl":      sl,
-                    "tp":      tp,
-                    "level":   lvl,
-                    "touches": touches,
-                    "rsi":     _rsi_val,
-                    "label":   "Resistance Breakout 🔓",
+                    "side":     "LONG 📈",
+                    "entry":    c0,
+                    "sl":       sl,
+                    "tp":       tp,
+                    "level":    lvl,
+                    "touches":  touches,
+                    "rsi":      _rsi_val,
+                    "label":    "Resistance Breakout 🔓",
+                    "grade":    grade_signal(touches),
+                    "vol_ok":   volume_confirmed(df),
                 }
 
     # ── SHORT signal ────────────────────────────────────
@@ -314,14 +365,16 @@ def detect_breakout(df: pd.DataFrame, sr: dict) -> dict | None:
                 sl = lvl + _atr                     # SL just above broken level
                 tp = c0 - (sl - c0) * RISK_REWARD
                 return {
-                    "side":    "SHORT 📉",
-                    "entry":   c0,
-                    "sl":      sl,
-                    "tp":      tp,
-                    "level":   lvl,
-                    "touches": touches,
-                    "rsi":     _rsi_val,
-                    "label":   "Support Breakdown 🔓",
+                    "side":     "SHORT 📉",
+                    "entry":    c0,
+                    "sl":       sl,
+                    "tp":       tp,
+                    "level":    lvl,
+                    "touches":  touches,
+                    "rsi":      _rsi_val,
+                    "label":    "Support Breakdown 🔓",
+                    "grade":    grade_signal(touches),
+                    "vol_ok":   volume_confirmed(df),
                 }
 
     return None
@@ -343,10 +396,12 @@ def format_signal(symbol: str, sig: dict, asset_type: str) -> str:
     d   = _decimals(symbol)
     fmt = f"{{:.{d}f}}"
     ico = "🟢" if "LONG" in sig["side"] else "🔴"
+    vol = "✅ High volume" if sig.get("vol_ok") else "⚠️ Normal volume"
 
     lines = [
         f"{ico} *S\\&R BREAKOUT — {symbol}* {ico}",
         f"",
+        f"🏆 Grade: `{sig['grade']}`",
         f"🏷 Asset: `{asset_type}`",
         f"📌 Direction: {sig['side']}",
         f"🔓 Broken level: `{fmt.format(sig['level'])}` ({sig['touches']} touches)",
@@ -356,6 +411,7 @@ def format_signal(symbol: str, sig: dict, asset_type: str) -> str:
         f"🎯 Take Profit: `{fmt.format(sig['tp'])}`",
         f"",
         f"📊 RSI: `{sig['rsi']:.1f}` | R:R `1:{RISK_REWARD}`",
+        f"📉 Volume: {vol}",
         f"📋 {sig['label']}",
         f"⏰ `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`",
         f"",
@@ -370,6 +426,11 @@ def format_signal(symbol: str, sig: dict, asset_type: str) -> str:
 def scan(symbol: str, df: pd.DataFrame, asset_type: str) -> None:
     if df.empty or len(df) < 60:
         log.warning(f"[{symbol}] Skipped — insufficient data ({len(df)} bars)")
+        return
+
+    # Session filter — skip Forex/Gold outside active hours
+    if not is_active_session(asset_type):
+        log.info(f"[{symbol}] Skipped — outside London/NY session")
         return
 
     sr  = get_sr_levels(df)
