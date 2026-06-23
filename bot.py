@@ -420,6 +420,131 @@ def format_signal(symbol: str, sig: dict, asset_type: str) -> str:
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════
+#  📢  CHANNEL CONTENT
+# ══════════════════════════════════════════════════════════
+
+# Collect prices & SR data during scan for channel posts
+_prices:  dict[str, float] = {}
+_sr_data: dict[str, dict]  = {}
+
+def _collect(symbol: str, price: float, sr: dict) -> None:
+    _prices[symbol]  = price
+    _sr_data[symbol] = sr
+
+
+def post_price_update() -> None:
+    """Post current prices of all scanned pairs."""
+    if not _prices:
+        return
+    now = datetime.utcnow().strftime("%H:%M UTC")
+
+    def fmt(sym, p):
+        return f"`{sym:<10}` `{p:.{_decimals(sym)}f}`"
+
+    fx    = [fmt(s, _prices[s]) for s in FOREX_PAIRS  if s in _prices]
+    gold  = [fmt(s, _prices[s]) for s in GOLD         if s in _prices]
+    cry   = [fmt(s, _prices[s]) for s in CRYPTO_PAIRS if s in _prices]
+
+    msg = (
+        f"📊 *MARKET UPDATE — {now}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n💱 *Forex*\n"  + "\n".join(fx)   +
+        f"\n\n🥇 *Gold*\n" + "\n".join(gold) +
+        f"\n\n🪙 *Crypto*\n"+ "\n".join(cry)  +
+        f"\n\n🤖 _Scanning for breakouts every 15 min…_"
+    )
+    send_telegram(msg)
+
+
+def post_session_open() -> None:
+    """Alert when London or New York session just opened."""
+    now   = datetime.utcnow()
+    hour  = now.hour
+    minute= now.minute
+    if hour == 8 and minute < 15:
+        send_telegram(
+            "🇬🇧 *LONDON SESSION OPEN*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "08:00 UTC — Market is active 🔥\n"
+            "Bot scanning Forex \\& Gold 🔍\n"
+            "High probability setups incoming 👀"
+        )
+    elif hour == 13 and minute < 15:
+        send_telegram(
+            "🇺🇸 *NEW YORK SESSION OPEN*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "13:00 UTC — Volatility increasing 🔥\n"
+            "London \\& NY overlap — best time for signals 📊\n"
+            "Bot on high alert 🤖"
+        )
+
+
+def post_morning_watchlist() -> None:
+    """Post daily watchlist at 07:45 UTC — 15 min before London open."""
+    now = datetime.utcnow()
+    if not (now.hour == 7 and now.minute >= 45):
+        return
+    if not _sr_data:
+        return
+
+    date_str = now.strftime("%A %d %B")
+    lines = [
+        f"📋 *WATCHLIST — {date_str}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Key levels to watch today:",
+        "",
+    ]
+    for sym, sr in _sr_data.items():
+        d = _decimals(sym)
+        if sr["resistance"]:
+            lvl, cnt = sr["resistance"][0]
+            lines.append(f"🔴 `{sym}` resistance `{lvl:.{d}f}` ({cnt}x)")
+        if sr["support"]:
+            lvl, cnt = sr["support"][0]
+            lines.append(f"🟢 `{sym}` support    `{lvl:.{d}f}` ({cnt}x)")
+
+    lines += ["", "Bot alerts when price breaks these levels 🔓",
+              "London open in 15 min ⏰"]
+    send_telegram("\n".join(lines))
+
+
+def check_near_level(symbol: str, sr: dict) -> None:
+    """Warn when price is within 0.3% of a key S&R level (3+ touches only)."""
+    current = sr["current"]
+    pct     = 0.003    # 0.3% proximity threshold
+    d       = _decimals(symbol)
+    key     = f"{symbol}_near"
+
+    if sr["resistance"]:
+        lvl, cnt = sr["resistance"][0]
+        if cnt >= 3 and 0 < (lvl - current) / current <= pct:
+            if not _is_duplicate(key):
+                send_telegram(
+                    f"⚠️ *LEVEL APPROACHING — {symbol}*\n\n"
+                    f"📍 Resistance: `{lvl:.{d}f}` ({cnt} touches)\n"
+                    f"💵 Current:    `{current:.{d}f}`\n"
+                    f"📏 Distance:   `{(lvl-current)/current*100:.2f}%` away\n\n"
+                    f"🔓 Breakout signal possible soon 👀\n"
+                    f"⏰ `{datetime.utcnow().strftime('%H:%M UTC')}`"
+                )
+                _mark_sent(key)
+
+    if sr["support"]:
+        lvl, cnt = sr["support"][0]
+        if cnt >= 3 and 0 < (current - lvl) / current <= pct:
+            if not _is_duplicate(key):
+                send_telegram(
+                    f"⚠️ *LEVEL APPROACHING — {symbol}*\n\n"
+                    f"📍 Support:  `{lvl:.{d}f}` ({cnt} touches)\n"
+                    f"💵 Current: `{current:.{d}f}`\n"
+                    f"📏 Distance: `{(current-lvl)/current*100:.2f}%` away\n\n"
+                    f"🔓 Breakdown signal possible soon 👀\n"
+                    f"⏰ `{datetime.utcnow().strftime('%H:%M UTC')}`"
+                )
+                _mark_sent(key)
+
+
+# ══════════════════════════════════════════════════════════
 #  🔍  SCANNER  (one asset at a time)
 # ══════════════════════════════════════════════════════════
 
@@ -435,6 +560,12 @@ def scan(symbol: str, df: pd.DataFrame, asset_type: str) -> None:
 
     sr  = get_sr_levels(df)
     sig = detect_breakout(df, sr)
+
+    # Collect for channel posts
+    _collect(symbol, sr["current"], sr)
+
+    # Near level warning
+    check_near_level(symbol, sr)
 
     log.info(
         f"[{symbol:10s}] "
@@ -473,7 +604,12 @@ def run_scan() -> None:
     # ── Crypto ───────────────────────────────────────────
     for pair in CRYPTO_PAIRS:
         scan(pair, fetch_crypto(pair), "Crypto")
-        time.sleep(2)   # Binance rate-limit safety
+        time.sleep(2)
+
+    # ── Channel content (after all prices collected) ─────
+    post_morning_watchlist()   # 07:45 UTC daily
+    post_session_open()        # London 08:00 / NY 13:00
+    post_price_update()        # every scan
 
 
 def main() -> None:
