@@ -97,6 +97,7 @@ SCAN_INTERVAL    = 300
 SIGNAL_COOLDOWN  = 3600
 NEWS_BLACKOUT    = 1800
 RETEST_EXPIRY    = 86400   # pending retests expire after 24 h
+DAILY            = 23 * 3600  # guard for once-per-day scheduled posts
 
 STATE_FILE = Path("state.json")
 
@@ -154,6 +155,10 @@ def save_state() -> None:
 
 def _is_duplicate(key: str) -> bool:
     return (time.time() - _state["signals"].get(key, 0)) < SIGNAL_COOLDOWN
+
+
+def _posted_within(key: str, seconds: int) -> bool:
+    return (time.time() - _state["signals"].get(key, 0)) < seconds
 
 
 def _mark_sent(key: str) -> None:
@@ -1268,6 +1273,90 @@ def format_signal(symbol: str, sig: dict, asset_type: str,
     ])
 
 # ══════════════════════════════════════════════════════════
+#  🌐  FREE MARKET DATA  (CoinGecko · Binance public · CryptoCompare)
+# ══════════════════════════════════════════════════════════
+
+def fetch_coingecko_global() -> dict | None:
+    """BTC/ETH dominance + total market cap from CoinGecko (no key needed)."""
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
+        r.raise_for_status()
+        d = r.json().get("data", {})
+        return {
+            "btc_dom":  round(d.get("market_cap_percentage", {}).get("btc", 0), 1),
+            "eth_dom":  round(d.get("market_cap_percentage", {}).get("eth", 0), 1),
+            "mcap_usd": d.get("total_market_cap", {}).get("usd", 0),
+            "mcap_chg": round(d.get("market_cap_change_percentage_24h_usd", 0), 2),
+        }
+    except Exception as exc:
+        log.warning(f"CoinGecko global: {exc}")
+        return None
+
+
+def fetch_coingecko_trending() -> list[dict]:
+    """Top 5 trending coins on CoinGecko (no key needed)."""
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
+        r.raise_for_status()
+        coins = r.json().get("coins", [])[:5]
+        return [{"name": c["item"]["name"], "symbol": c["item"]["symbol"].upper(),
+                 "rank": c["item"].get("market_cap_rank")} for c in coins]
+    except Exception as exc:
+        log.warning(f"CoinGecko trending: {exc}")
+        return []
+
+
+def fetch_binance_top_movers() -> tuple[list, list]:
+    """Top 3 gainers + top 3 losers from Binance 24h ticker (no key needed)."""
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
+        r.raise_for_status()
+        tickers = [t for t in r.json()
+                   if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 5_000_000]
+        tickers.sort(key=lambda t: float(t["priceChangePercent"]), reverse=True)
+        gainers = [{"symbol": t["symbol"], "pct": float(t["priceChangePercent"])}
+                   for t in tickers[:3]]
+        losers  = [{"symbol": t["symbol"], "pct": float(t["priceChangePercent"])}
+                   for t in tickers[-3:]]
+        return gainers, losers
+    except Exception as exc:
+        log.warning(f"Binance movers: {exc}")
+        return [], []
+
+
+def fetch_binance_funding() -> list[dict]:
+    """Extreme funding rates from Binance perpetual futures (no key needed)."""
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10)
+        r.raise_for_status()
+        rates = [{"symbol": t["symbol"], "rate": float(t["lastFundingRate"]) * 100}
+                 for t in r.json() if t.get("lastFundingRate")]
+        extremes = [x for x in rates if abs(x["rate"]) > 0.05]
+        extremes.sort(key=lambda x: abs(x["rate"]), reverse=True)
+        return extremes[:5]
+    except Exception as exc:
+        log.warning(f"Binance funding: {exc}")
+        return []
+
+
+def fetch_crypto_news() -> list[dict]:
+    """Latest crypto news from CryptoCompare (no key needed for basic use)."""
+    try:
+        r = requests.get(
+            "https://min-api.cryptocompare.com/data/v2/news/",
+            params={"lang": "EN", "sortOrder": "latest"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        items = r.json().get("Data", [])[:5]
+        return [{"title": i["title"], "source": i["source_info"]["name"]}
+                for i in items]
+    except Exception as exc:
+        log.warning(f"Crypto news: {exc}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════
 #  📢  CHANNEL CONTENT
 # ══════════════════════════════════════════════════════════
 
@@ -1373,6 +1462,174 @@ def post_weekly_summary() -> None:
     _state["last_weekly_post"] = week
     _state["trade_results"]    = {"week": week, "wins": 0, "losses": 0}
     save_state()
+
+
+def post_pre_london_briefing() -> None:
+    """06:00 UTC — BTC dominance, market cap, Fear & Greed, news count."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 6 or now.minute >= 15:
+        return
+    key = "daily_pre_london"
+    if _posted_within(key, DAILY):
+        return
+    gdata    = fetch_coingecko_global()
+    fg       = get_fear_greed()
+    today    = now.strftime("%Y-%m-%d")
+    upcoming = sum(1 for e in _state.get("calendar", {}).values()
+                   if e.get("date", "").startswith(today) and e.get("impact") == "High")
+    lines = [
+        f"☀️ *PRE-LONDON BRIEFING — {now.strftime('%d %b')}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "London opens in 2 hours 🕗", "",
+    ]
+    if gdata:
+        mcap_b = gdata["mcap_usd"] / 1e12
+        arrow  = "📈" if gdata["mcap_chg"] >= 0 else "📉"
+        lines += [
+            f"🌍 *Crypto Market Cap:* `${mcap_b:.2f}T` {arrow} `{gdata['mcap_chg']:+.2f}%`",
+            f"₿ *BTC Dom:* `{gdata['btc_dom']}%`  |  Ξ *ETH Dom:* `{gdata['eth_dom']}%`",
+        ]
+    if fg:
+        lines.append(f"🧠 *Sentiment:* `{fg['value']} — {fg['label']}` {_fg_icon(fg['value'])}")
+    lines += [
+        f"📰 *High-impact events today:* `{upcoming}`",
+        "", "🔔 Bot watching for London breakouts — alerts on fire 🔓",
+    ]
+    send_telegram("\n".join(lines))
+    _mark_sent(key)
+
+
+def post_midmorning_update() -> None:
+    """10:00 UTC — CoinGecko trending coins + Binance extreme funding rates."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 10 or now.minute >= 15:
+        return
+    key = "daily_midmorning"
+    if _posted_within(key, DAILY):
+        return
+    trending = fetch_coingecko_trending()
+    funding  = fetch_binance_funding()
+    if not trending and not funding:
+        return
+    lines = [
+        f"🔥 *MID-MORNING UPDATE — {now.strftime('%H:%M UTC')}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if trending:
+        lines.append("\n🚀 *Trending on CoinGecko:*")
+        for c in trending:
+            rank = f"#{c['rank']}" if c["rank"] else "—"
+            lines.append(f"  • `{c['symbol']}` {c['name']} ({rank})")
+    if funding:
+        lines.append("\n⚡ *Extreme Funding Rates \\(Binance\\):*")
+        for f in funding:
+            side = "longs paying 🔴" if f["rate"] > 0 else "shorts paying 🟢"
+            lines.append(f"  • `{f['symbol']}` `{f['rate']:+.4f}%` — {side}")
+        lines.append("_High positive = crowded longs = reversal risk_")
+    send_telegram("\n".join(lines))
+    _mark_sent(key)
+
+
+def post_midday_pulse() -> None:
+    """12:00 UTC — Binance 24h top movers ahead of NY open."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 12 or now.minute >= 15:
+        return
+    key = "daily_midday"
+    if _posted_within(key, DAILY):
+        return
+    gainers, losers = fetch_binance_top_movers()
+    if not gainers:
+        return
+    lines = [
+        f"📊 *MIDDAY PULSE — {now.strftime('%H:%M UTC')}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "NY opens in 1 hour 🕐", "",
+        "📈 *Top Gainers \\(24h\\):*",
+    ]
+    for g in gainers:
+        lines.append(f"  🟢 `{g['symbol']}` `+{g['pct']:.2f}%`")
+    lines.append("\n📉 *Top Losers \\(24h\\):*")
+    for l in losers:
+        lines.append(f"  🔴 `{l['symbol']}` `{l['pct']:.2f}%`")
+    lines.append("\n🎯 Best signals fire during London\\+NY overlap \\(13–17 UTC\\)")
+    send_telegram("\n".join(lines))
+    _mark_sent(key)
+
+
+def post_london_close() -> None:
+    """16:00 UTC — London session recap: signals + open trades."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 16 or now.minute >= 15:
+        return
+    key = "daily_london_close"
+    if _posted_within(key, DAILY):
+        return
+    sigs_today  = _state.get("eod_signals", [])
+    open_count  = len(_state.get("open_trades", {}))
+    forex_sigs  = [s for s in sigs_today if "/" not in s["symbol"]]
+    lines = [
+        f"🇬🇧 *LONDON CLOSE — {now.strftime('%H:%M UTC')}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "London session closing now 🔔", "",
+        f"📊 Forex/Gold signals today: `{len(forex_sigs)}`",
+        f"⏳ Open trades: `{open_count}`",
+        "",
+        "🇺🇸 New York session active until 22:00 UTC",
+        "🪙 Crypto markets open 24/7 — bot never sleeps 🤖",
+    ]
+    send_telegram("\n".join(lines))
+    _mark_sent(key)
+
+
+def post_afternoon_crypto() -> None:
+    """18:00 UTC — Latest crypto news headlines from CryptoCompare."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 18 or now.minute >= 15:
+        return
+    key = "daily_afternoon_crypto"
+    if _posted_within(key, DAILY):
+        return
+    news = fetch_crypto_news()
+    if not news:
+        return
+    lines = [
+        f"📰 *CRYPTO NEWS — {now.strftime('%H:%M UTC')}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for i, item in enumerate(news[:4], 1):
+        title = item["title"].replace("*", "").replace("_", "").replace("`", "")
+        lines.append(f"{i}\\. {title}\n   _— {item['source']}_")
+    lines.append("\n🤖 _Scanning for crypto breakouts 24/7_")
+    send_telegram("\n".join(lines))
+    _mark_sent(key)
+
+
+def post_ny_check() -> None:
+    """20:00 UTC — NY session check: open trades + day's signal recap."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 20 or now.minute >= 15:
+        return
+    key = "daily_ny_check"
+    if _posted_within(key, DAILY):
+        return
+    sigs_today  = _state.get("eod_signals", [])
+    open_trades = _state.get("open_trades", {})
+    lines = [
+        f"🇺🇸 *NY SESSION CHECK — {now.strftime('%H:%M UTC')}*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "2 hours until NY close 🕙", "",
+        f"📊 Signals today: `{len(sigs_today)}`",
+    ]
+    for s in sigs_today[-3:]:
+        lines.append(f"  • `{s['symbol']}` {s['side']} @ `{s['entry']}`")
+    lines.append(f"\n⏳ Open trades: `{len(open_trades)}`")
+    for t in list(open_trades.values())[:3]:
+        d = _decimals(t["symbol"])
+        lines.append(f"  • `{t['symbol']}` {t['side']} @ `{t['entry']:.{d}f}`")
+    lines.append("\n🌙 EOD summary at 21:00 UTC")
+    send_telegram("\n".join(lines))
+    _mark_sent(key)
 
 
 def check_near_level(symbol: str, sr: dict) -> None:
@@ -1522,6 +1779,12 @@ def run_scan() -> None:
     post_morning_watchlist()
     post_session_open()
     post_price_update()
+    post_pre_london_briefing()
+    post_midmorning_update()
+    post_midday_pulse()
+    post_london_close()
+    post_afternoon_crypto()
+    post_ny_check()
     post_eod_summary()
     post_weekly_summary()
 
