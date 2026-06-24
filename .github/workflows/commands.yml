@@ -1,26 +1,30 @@
-name: SR Breakout Bot Scan
+name: SR Bot Commands (fast)
+
+# Runs every minute — only processes Telegram commands, no market scan.
+# This gives ~1 min response time to /status /price /trades etc.
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch:
 
 jobs:
-  scan:
+  commands:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 2
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Restore state.json from previous run so duplicate-guard works across runs
+      # Share state with the main scan workflow
       - name: Restore state cache
         uses: actions/cache/restore@v4
         with:
           path: state.json
-          key: bot-state-${{ github.run_id }}
+          key: bot-state-cmd-${{ github.run_id }}
           restore-keys: |
+            bot-state-cmd-
             bot-state-
 
       - name: Set up Python 3.11
@@ -32,29 +36,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot scan
+      - name: Process commands
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          # OANDA (free demo) — sign up at oanda.com, set these secrets to enable execution
           OANDA_API_KEY:     ${{ secrets.OANDA_API_KEY }}
           OANDA_ACCOUNT_ID:  ${{ secrets.OANDA_ACCOUNT_ID }}
           OANDA_DEMO:        ${{ vars.OANDA_DEMO || 'true' }}
-          # Binance (crypto) — generate free API key in Binance account settings
           BINANCE_API_KEY:   ${{ secrets.BINANCE_API_KEY }}
           BINANCE_SECRET:    ${{ secrets.BINANCE_SECRET }}
-          # KuCoin (crypto) — alternative to Binance
           KUCOIN_API_KEY:    ${{ secrets.KUCOIN_API_KEY }}
           KUCOIN_SECRET:     ${{ secrets.KUCOIN_SECRET }}
           KUCOIN_PASSPHRASE: ${{ secrets.KUCOIN_PASSPHRASE }}
-          # Order size for crypto (e.g. 0.001 BTC). Set as a repo variable.
-          CRYPTO_ORDER_SIZE: ${{ vars.CRYPTO_ORDER_SIZE || '0.001' }}
-        run: python bot.py --once
+        run: python bot.py --commands-only
 
-      # Always save state even if the scan fails, so cooldowns persist
       - name: Save state cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state.json
-          key: bot-state-${{ github.run_id }}
+          key: bot-state-cmd-${{ github.run_id }}
