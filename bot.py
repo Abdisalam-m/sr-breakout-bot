@@ -1066,7 +1066,8 @@ def oanda_execute(symbol: str, sig: dict) -> str | None:
         "type": "MARKET", "instrument": instrument, "units": str(units),
         "timeInForce": "FOK",
         "stopLossOnFill":   {"price": f"{sig['sl']:.5f}"},
-        "takeProfitOnFill": {"price": f"{sig['tp2']:.5f}"},   # use TP2 (2R) for broker order
+       "takeProfitOnFill": {"price": f"{sig.get('tp2') or sig.get('tp1', sig['sl']):.5f}"},
+   # use TP2 (2R) for broker order
     }}
     try:
         r = requests.post(f"{base}/v3/accounts/{OANDA_ACCOUNT_ID}/orders",
